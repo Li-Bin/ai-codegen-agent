@@ -140,22 +140,3 @@ if stdout:
 if err:
     print(err)
 
-# stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-# out_dir = BASE / "generated"
-# out_dir.mkdir(exist_ok=True)
-
-# out_path = out_dir / f"gen_{stamp}.py"
-# out_path.write_text(code, encoding="utf-8")
-
-# ok, err, stdout = run_generated(out_path)
-# with (BASE / "runs.log").open("a", encoding="utf-8") as f:
-#     f.write(f"{stamp}\ttask={args.task}\tmode={args.mode}\ttimeout={args.timeout}\t"
-#             f"model={args.model}\ttokens={tokens}\t"
-#             f"result={'PASS' if ok else 'FAIL'}\n")
-
-# print(f"--- 已寫入 {out_path} ---")
-# print("=== PASS ===" if ok else "=== FAIL ===")
-# if stdout:
-#     print(stdout)
-# if err:
-#     print(err)
