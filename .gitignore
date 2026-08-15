@@ -1,0 +1,15 @@
+# 祕密
+.env
+
+# 環境
+.venv/
+venv/
+
+# 產出與紀錄
+generated/
+runs.log
+
+# Python 垃圾
+__pycache__/
+*.pyc
+.pytest_cache/
