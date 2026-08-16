@@ -1,4 +1,4 @@
-# ai-codegen-agent (V1)
+# ai-codegen-agent (V2)
 
 用 Gemini 生成 Python 程式 → 自動執行 → 用 pytest 金樣判定 → 失敗訊息回授給模型修正 → 直到通過或停機。
 
