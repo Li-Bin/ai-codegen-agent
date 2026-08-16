@@ -1,0 +1,450 @@
+【任務】依照下方介面協定 v1.2，實作 ifft_sim 套件的 core 部分。
+
+範圍（本階段只做這些檔案）：
+  ifft_sim/__init__.py
+  ifft_sim/core/__init__.py
+  ifft_sim/core/types.py
+  ifft_sim/core/signal_gen.py
+  ifft_sim/core/spectrum.py
+  ifft_sim/core/metrics.py
+
+不在範圍：ui/app.py（下一階段）、tests/（由外部判準提供，禁止產出）、
+pyproject.toml（暫不需要）。
+
+協定中的 §5（測試協定）與 §7（測試範例）是判準端的內容，供你理解
+驗收標準用；§9 的回報格式不適用於本模式——你只輸出檔案區塊。
+協定 §2、§3 的型別與函式簽章一字不得改。
+
+=====================================================================
+# IFFT 互動式訊號還原模擬器 — 介面協定 v1.2
+
+> **v1.2 修訂（2026-08-16，實測校準）**
+> 判準端測試套件已依本協定實作完成，並以正確參考實作＋4 組突變測試驗證。
+> 過程中實測推翻了 §5.1 的一個數字：
+> 1. **RTOL_LEAKY 由 0.05 修正為 0.16**。T-06 參數下正確實作的實測洩漏誤差為 0.1156，原上限 0.05 會把正確實作誤判為 fail。
+> 2. T-06 改為**雙邊界限**，新增 `RTOL_LEAK_MIN = 0.02`：下限擋「偷改參數成對齊 bin」的作弊，上限（依失敗模式校準：no-op 0.283、只除一 bin 0.179、濾錯目標 0.755）擋濾波失效。
+> 3. 新增 `RTOL_EXACT = 1e-9`：Parseval 與線性屬**尺度相依**恆等式，能量隨振幅平方與 N 成長，絕對容差會在大振幅下誤判——改用相對容差。ATOL_EXACT 的適用範圍收窄為單位尺度的往返測試。
+
+> **v1.1 修訂（2026-08-16，已對 PyPI／官方文件查證）**
+> 1. §5.2 套件表補上實際版本、授權，並列出**易混淆的錯誤套件名**。
+> 2. §6.1 明訂 widget MUST 以 **key** 定址，不得以索引定址（官方文件已確認支援 key 取得）。
+> 3. T-11 改寫：原本的「斷言 chart 元件存在」降級，因 AppTest 對圖表元件的原生支援未經確認；改以 `at.exception` 為主斷言，並新增 T-11b 以 `st.metric` 驗證 UI 確實接到 core 的計算結果。
+
+> 本文件是給實作端（AI agent 或人）的**契約**，不是教學。
+> 凡標記 **MUST** 的條款不得更動；標記 **SHOULD** 的可在說明理由後調整。
+> 實作端不得自行更改函式簽章、型別、例外名稱、UI widget key。
+
+---
+
+## 0. 決策紀錄（先讀，避免實作端「自作聰明」）
+
+| # | 決策 | 理由 | 影響範圍 |
+|---|---|---|---|
+| D-1 | UI 選 **Streamlit**，PyQt 為備案 | Streamlit 內建 `streamlit.testing.v1.AppTest`，可在無顯示器的 CI 上做 headless UI 測試；PyQt 需 `pytest-qt` +虛擬 X server。 | 只影響 `ifft_sim/ui/`，core 不受影響 |
+| D-2 | 頻域一律用 `numpy.fft.rfft` / `irfft`，**不用** `fft` / `ifft` | 對實數訊號，`rfft` 只回傳單邊頻譜。若用雙邊 `fft` 後把某些 bin 歸零，會破壞 Hermitian 對稱性，`ifft` 出來帶虛部殘留，得再 `.real` 硬砍——那是掩蓋錯誤，不是解法。`irfft` 從結構上保證輸出為實數。 | `core/spectrum.py`、測試 T-02 |
+| D-3 | `sample_rate_hz` **必須外顯**為參數 | 題目只給「主訊號頻率／雜訊頻率／取樣點數」三項，但少了取樣率，時間軸無定義、Nyquist 無法檢查、頻率解析度 Δf 也算不出來。UI 可給預設值收在 advanced 區塊，但 core API 一定要有。 | `SignalSpec`、UI 版面 |
+| D-4 | core 層**禁止** import 任何 UI／繪圖套件 | 讓核心邏輯可在純 CPU、無 GUI 環境測試；也逼實作端把運算與呈現分離。此條由測試 T-10 強制執行。 | 全專案 |
+| D-5 | 數值容差寫死在協定裡，不由實作端自訂 | AI agent 最常見的失敗是「測試寫得比實作鬆」，湊過 green。容差集中定義於 §5.1。 | 全測試 |
+
+---
+
+## 1. 專案結構（MUST）
+
+```
+ifft_sim/
+├── __init__.py
+├── core/                    # 純運算層，零 UI 依賴
+│   ├── __init__.py
+│   ├── types.py             # dataclass 與例外
+│   ├── signal_gen.py        # 時域訊號合成
+│   ├── spectrum.py          # FFT / 濾除 / IFFT
+│   └── metrics.py           # RMSE / SNR / 峰值頻率
+└── ui/
+    ├── __init__.py
+    └── app.py               # Streamlit adapter（只做 讀參數→呼叫 core→畫圖）
+tests/
+├── test_types.py
+├── test_signal_gen.py
+├── test_spectrum.py
+├── test_metrics.py
+├── test_properties.py       # hypothesis property-based
+├── test_architecture.py     # 強制 D-4
+└── test_app.py              # streamlit AppTest
+pyproject.toml
+```
+
+---
+
+## 2. 資料型別（`core/types.py`，MUST）
+
+```python
+from dataclasses import dataclass
+import numpy as np
+from numpy.typing import NDArray
+
+class SimulatorError(ValueError):
+    """本套件所有可預期錯誤的基底類別。"""
+
+class InvalidParameterError(SimulatorError):
+    """參數超出定義域（負頻率、N 太小等）。"""
+
+class NyquistViolationError(SimulatorError):
+    """sample_rate_hz <= 2 * max(訊號頻率)。"""
+
+
+@dataclass(frozen=True)
+class SignalSpec:
+    main_freq_hz: float          # > 0
+    noise_freq_hz: float         # > 0
+    n_samples: int               # >= 8
+    sample_rate_hz: float        # > 0，且須滿足 Nyquist
+    main_amp: float = 1.0        # > 0
+    noise_amp: float = 0.3       # >= 0
+    main_phase_rad: float = 0.0
+    noise_phase_rad: float = 0.0
+    gaussian_sigma: float = 0.0  # >= 0，白噪標準差
+    seed: int | None = None      # 白噪的亂數種子
+
+    def __post_init__(self) -> None:
+        """MUST 在此完成全部驗證，見 §4。"""
+
+    @property
+    def duration_s(self) -> float:      # n_samples / sample_rate_hz
+        ...
+
+    @property
+    def freq_resolution_hz(self) -> float:   # Δf = sample_rate_hz / n_samples
+        ...
+
+
+@dataclass(frozen=True)
+class SignalBundle:
+    t: NDArray[np.float64]        # shape (N,)，t[0] == 0.0
+    clean: NDArray[np.float64]    # 只有主訊號
+    noise: NDArray[np.float64]    # 只有雜訊（弦波 + 可選白噪）
+    noisy: NDArray[np.float64]    # clean + noise，恆等式 MUST 成立
+
+
+@dataclass(frozen=True)
+class Spectrum:
+    freqs: NDArray[np.float64]        # shape (N//2 + 1,)，來自 rfftfreq
+    coeffs: NDArray[np.complex128]    # shape (N//2 + 1,)，來自 rfft
+    n_samples: int                    # 原始 N，irfft 還原長度時要用
+    sample_rate_hz: float
+```
+
+**不可變性 MUST**：`Spectrum` 的任何轉換函式一律回傳**新物件**，不得就地修改 `coeffs`。
+
+---
+
+## 3. 核心 API（MUST，簽章不得更動）
+
+### 3.1 `core/signal_gen.py`
+
+```python
+def generate(spec: SignalSpec) -> SignalBundle:
+    """
+    t[n]     = n / fs,  n = 0..N-1
+    clean[n] = A_main  * sin(2π f_main  t[n] + φ_main)
+    tone[n]  = A_noise * sin(2π f_noise t[n] + φ_noise)
+    white[n] = N(0, σ²)，僅在 σ > 0 時產生，並以 spec.seed 建立
+               np.random.default_rng(seed)（MUST 用 Generator，不用 np.random.*）
+    noise    = tone + white
+    noisy    = clean + noise
+    """
+```
+
+### 3.2 `core/spectrum.py`
+
+```python
+def forward(x: NDArray[np.float64], sample_rate_hz: float) -> Spectrum:
+    """np.fft.rfft(x) + np.fft.rfftfreq(len(x), 1/fs)。x 非 1-D 或長度 < 8 → InvalidParameterError。"""
+
+def suppress_bands(
+    spectrum: Spectrum,
+    bands: Sequence[tuple[float, float]],
+    mode: Literal["notch", "bandpass"] = "notch",
+) -> Spectrum:
+    """
+    以 freqs 為準選出落在任一 [lo, hi]（閉區間）內的 bin。
+    mode="notch"    → 選中的 bin 歸零
+    mode="bandpass" → 未選中的 bin 歸零
+    bands 為空 list：notch 回傳等值副本；bandpass 回傳全零 coeffs。
+    任一 lo > hi 或 lo < 0 → InvalidParameterError。
+    """
+
+def suppress_tone(spectrum: Spectrum, center_hz: float, bandwidth_hz: float | None = None) -> Spectrum:
+    """
+    便利包裝：bandwidth 預設為 1.5 * Δf（Δf = fs / n_samples），
+    等價於 suppress_bands(spectrum, [(c - bw/2, c + bw/2)], "notch")。
+    """
+
+def reconstruct(spectrum: Spectrum) -> NDArray[np.float64]:
+    """np.fft.irfft(coeffs, n=spectrum.n_samples)。回傳 dtype MUST 為 float64，長度 MUST == n_samples。"""
+```
+
+### 3.3 `core/metrics.py`
+
+```python
+def rmse(a: NDArray[np.float64], b: NDArray[np.float64]) -> float:
+    """長度不一致 → InvalidParameterError。"""
+
+def snr_db(signal: NDArray[np.float64], noise: NDArray[np.float64]) -> float:
+    """10 * log10(P_signal / P_noise)；P_noise == 0 → 回傳 float('inf')。"""
+
+def peak_frequency(spectrum: Spectrum, ignore_dc: bool = True) -> float:
+    """|coeffs| 最大者對應的 freqs 值；ignore_dc=True 時跳過 index 0。"""
+
+def band_energy(spectrum: Spectrum, lo_hz: float, hi_hz: float) -> float:
+    """該頻帶內 |coeffs|² 之和。"""
+```
+
+---
+
+## 4. 參數驗證表（MUST，逐條對應測試）
+
+| 條件 | 例外 |
+|---|---|
+| `main_freq_hz <= 0` 或 `noise_freq_hz <= 0` | `InvalidParameterError` |
+| `n_samples < 8` | `InvalidParameterError` |
+| `n_samples` 非 `int`（含 `bool`） | `InvalidParameterError` |
+| `sample_rate_hz <= 0` | `InvalidParameterError` |
+| `main_amp <= 0`、`noise_amp < 0`、`gaussian_sigma < 0` | `InvalidParameterError` |
+| `sample_rate_hz <= 2 * max(main_freq_hz, noise_freq_hz)` | `NyquistViolationError` |
+
+Nyquist 檢查 MUST 在其他數值檢查**之後**執行，確保錯誤訊息可預期。
+例外訊息 MUST 含出問題的參數名與實際值。
+
+---
+
+## 5. 測試協定
+
+### 5.1 容差常數（MUST 定義於 `tests/conftest.py`，測試只准引用不准就地寫死）
+
+```python
+ATOL_EXACT    = 1e-12  # 單位尺度訊號的 FFT 往返（實測 ~1e-16，留四個數量級）
+RTOL_EXACT    = 1e-9   # 尺度相依精確恆等式：Parseval、線性（相對容差，理由見 v1.2 修訂）
+ATOL_ALIGNED  = 1e-10  # 頻率對齊 bin 時的濾除還原誤差（實測 ~5e-15）
+RTOL_LEAK_MIN = 0.02   # 洩漏誤差下限（× main_amp）——誤差趨近零代表參數被改成對齊 bin
+RTOL_LEAKY    = 0.16   # 洩漏誤差上限（× main_amp）——實測正確值 0.1156；
+                       # no-op 0.283 / 只除一 bin 0.179 / 濾錯目標 0.755 全數超標
+```
+
+### 5.2 第三方套件（MUST）
+
+| 套件（PyPI 名稱） | 查證版本 | 授權 | 用途 |
+|---|---|---|---|
+| `pytest` | 9.1.1 | MIT | 測試框架、`pytest.raises`、`pytest.mark.parametrize` |
+| `pytest-cov` | 7.1.0 | MIT | 覆蓋率門檻，`ifft_sim/core` MUST >= 90% |
+| `hypothesis` | 6.164.0 | MPL-2.0 | property-based 測試（線性、Parseval、往返） |
+| `numpy` | — | BSD | `numpy.testing.assert_allclose`，MUST 明寫 `rtol` / `atol` |
+| `streamlit` | — | Apache-2.0 | `streamlit.testing.v1.AppTest`，headless UI 測試 |
+
+**版本注意事項（MUST 遵守）**
+
+- pytest 已進入 **9.x**。相依不得釘在 `pytest<9`，也不得抄襲網路上以 7.x／8.x 為前提的寫法。
+- `hypothesis` 的 pytest plugin **內建於本體**。MUST NOT 安裝 `hypothesis-pytest`——該套件已廢棄，其官方說明本身就標示為不需要的 legacy 套件。
+- 覆蓋率套件的正確名稱**只有** `pytest-cov`。MUST NOT 使用 `pytest-coverage`（空殼套件，僅相依於 `pytest-cover`）或 `pytest-cover`（pytest-cov 的廢棄分支）。
+- `numpy.testing` 屬 NumPy 本體，不需另行安裝。
+
+> 若 D-1 改採 PyQt：以 `pytest-qt` 取代 `AppTest`，其餘不變。
+
+### 5.3 測試案例清單（MUST 全數實作，test id 用表中編號）
+
+| ID | 檔案 | 斷言內容 |
+|---|---|---|
+| T-01 | test_spectrum | `reconstruct(forward(x, fs))` ≈ `x`，`atol=ATOL_EXACT` |
+| T-02 | test_spectrum | `reconstruct(...)` 的 `dtype == np.float64` 且 `len == n_samples`（含 N 為奇數的情形） |
+| T-03 | test_properties | Parseval：`Σ x[n]² ≈ (1/N)(|X₀|² + 2Σ_{k=1}^{K}|Xₖ|² + [N 為偶數時] |X_{N/2}|²)`，其中 K = ⌈N/2⌉−1 |
+| T-04 | test_metrics | 主頻設為 Δf 整數倍時，`peak_frequency` **等於** `main_freq_hz`（`atol=ATOL_EXACT`） |
+| T-05 | test_spectrum | 主頻與雜訊頻率皆對齊 bin → `suppress_tone` 濾除雜訊後還原，`rmse(reconstructed, clean) < ATOL_ALIGNED` |
+| T-06 | test_spectrum | 頻率**未**對齊 bin（f=137, f_noise=311, fs=1000, N=256）→ 濾除後 `RTOL_LEAK_MIN * main_amp < rmse < RTOL_LEAKY * main_amp`（雙邊）。此案例存在的目的就是暴露頻譜洩漏，**不得**改參數讓它變乾淨——下限就是抓這種作弊的 |
+| T-07 | test_types | 對 §4 每一列各一個 `pytest.raises`，以 `parametrize` 展開 |
+| T-08 | test_properties | 線性（hypothesis）：`forward(a*x + b*y)` ≈ `a*forward(x) + b*forward(y)` 的 coeffs |
+| T-09 | test_signal_gen | 同 `seed` 兩次 `generate` 結果逐點相同；不同 seed 不同。且 `noisy == clean + noise`（`atol=ATOL_EXACT`） |
+| T-10 | test_architecture | 以 `ast` 靜態掃描 `ifft_sim/core/**.py`，斷言 import 名單不含 `streamlit`、`PyQt5`、`PyQt6`、`matplotlib`、`plotly`、`tkinter` |
+| T-11 | test_app | `AppTest.from_file` 啟動 → **以 key 設定**各 widget → `run()` → `assert not at.exception`。含一組 Nyquist 違反參數，斷言 `at.error` 有訊息且仍無 exception |
+| T-11b | test_app | UI MUST 以 `st.metric` 顯示 `rmse(reconstructed, clean)`；測試斷言該 metric 數值與直接呼叫 core 算出的結果一致（`rtol=1e-6`）。此條取代「圖是否畫出」，因為它驗證的是 UI 真的接上了 core，而非只是沒當掉 |
+| T-12 | test_spectrum | `suppress_bands` 未修改輸入：呼叫後原 `spectrum.coeffs` 與呼叫前的副本相同 |
+| T-13 | test_metrics | `snr_db`：零雜訊回傳 `inf`；已知振幅組合的結果符合手算值（`rtol=1e-9`） |
+
+### 5.4 測試禁令（MUST NOT）
+
+- 不得使用 `time.sleep`、網路存取、讀寫暫存檔以外的檔案系統操作。
+- 不得使用未固定 seed 的亂數。
+- 不得為了通過而放寬 §5.1 的容差；若某案例過不了，回報實作缺陷，不改容差。
+- 不得用 `assert result is not None` 這類無資訊斷言充數。
+- 不得把實作邏輯搬進測試（例如在測試裡重寫一份 IFFT 再比對自己）。
+
+---
+
+## 6. UI 契約（`ui/app.py`，MUST）
+
+UI 層**只准**做三件事：讀 widget → 建 `SignalSpec` → 呼叫 core 並繪圖。任何算式出現在此檔即違約。
+
+### 6.1 Widget key（固定，AppTest 靠它定址）
+
+**MUST**：每個 widget 都要給 `key=`，且測試 MUST 以 key 取得（`at.number_input("main_freq")`），**MUST NOT** 以索引取得（`at.number_input[0]`）。理由：索引依畫面出現順序決定，日後在 UI 多插一個輸入框就會讓全部測試錯位——那是假的穩定度。Streamlit 官方文件已確認有設 key 的 widget 可直接以 key 取得。
+
+| key | 元件 | 範圍／預設 |
+|---|---|---|
+| `main_freq` | `number_input` | 1.0–500.0，預設 50.0 |
+| `noise_freq` | `number_input` | 1.0–500.0，預設 120.0 |
+| `n_samples` | `select_slider` | {64, 128, 256, 512, 1024, 2048}，預設 512 |
+| `sample_rate` | `number_input` | 100.0–20000.0，預設 1000.0 |
+| `noise_amp` | `slider` | 0.0–2.0，預設 0.3 |
+| `gaussian_sigma` | `slider` | 0.0–1.0，預設 0.0 |
+| `apply_filter` | `checkbox` | 預設 True |
+| `notch_bw` | `slider` | 0.5–10.0（單位：Δf 的倍數），預設 1.5 |
+
+### 6.2 版面
+
+1. 側邊欄放全部輸入。
+2. 主區塊第一張圖（**必要交付**）：時域波形，三條曲線疊圖 — `clean`（虛線）、`noisy`、`reconstructed`。x 軸 `t`（秒），y 軸振幅。
+3. 主區塊第二張圖（SHOULD）：單邊振幅頻譜 `|coeffs|` vs `freqs`，濾除前後對照。
+4. 指標列：`rmse(reconstructed, clean)` 為 **MUST**，且 MUST 用 `st.metric(label="rmse", ...)` 呈現（T-11b 靠它驗證 UI↔core 的連接）。`snr_db`、`peak_frequency`、Δf 實際值為 SHOULD。
+
+### 6.3 錯誤處理
+
+捕捉 `SimulatorError`，以 `st.error(str(e))` 顯示後 `st.stop()`。MUST NOT 讓 traceback 直接噴到畫面。特別是 Nyquist 違反時，訊息要指出目前 fs 與所需最小 fs。
+
+---
+
+## 7. 附錄：測試風格參考實作（實作端 MUST 沿用此風格）
+
+```python
+# tests/test_spectrum.py
+import numpy as np
+import pytest
+from numpy.testing import assert_allclose
+
+from ifft_sim.core.signal_gen import generate
+from ifft_sim.core.spectrum import forward, reconstruct, suppress_tone
+from ifft_sim.core.types import SignalSpec
+from ifft_sim.core.metrics import rmse
+from tests.conftest import ATOL_EXACT, ATOL_ALIGNED, RTOL_LEAK_MIN, RTOL_LEAKY
+
+
+def make_spec(**kw) -> SignalSpec:
+    base = dict(
+        main_freq_hz=50.0, noise_freq_hz=125.0,
+        n_samples=512, sample_rate_hz=1000.0,
+        main_amp=1.0, noise_amp=0.4,
+    )
+    return SignalSpec(**{**base, **kw})
+
+
+@pytest.mark.parametrize("n", [64, 128, 255, 512, 1023])
+def test_T01_roundtrip_is_identity(n):
+    """T-01: irfft ∘ rfft 必須是恆等映射（含奇數長度）。"""
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(n)
+    assert_allclose(reconstruct(forward(x, 1000.0)), x, atol=ATOL_EXACT, rtol=0)
+
+
+@pytest.mark.parametrize("n", [512, 1023])
+def test_T02_reconstruction_is_real_float64(n):
+    """T-02: 用 rfft/irfft 的結構性保證，輸出不得帶虛部。"""
+    out = reconstruct(forward(np.random.default_rng(1).standard_normal(n), 1000.0))
+    assert out.dtype == np.float64
+    assert out.shape == (n,)
+
+
+def test_T05_notch_removes_bin_aligned_noise():
+    """T-05: 兩個頻率都落在 bin 上時，陷波後應精確還原主訊號。"""
+    spec = make_spec()                     # Δf = 1000/512；50 與 125 皆為其整數倍附近
+    df = spec.freq_resolution_hz
+    spec = make_spec(
+        main_freq_hz=round(50 / df) * df,
+        noise_freq_hz=round(125 / df) * df,
+    )
+    b = generate(spec)
+    filtered = suppress_tone(forward(b.noisy, spec.sample_rate_hz), spec.noise_freq_hz)
+    assert rmse(reconstruct(filtered), b.clean) < ATOL_ALIGNED
+
+
+def test_T06_leakage_is_bounded_on_both_sides():
+    """T-06: 頻率不對齊 bin 時洩漏必然存在——誤差雙邊有界（v1.2 實測校準）。"""
+    spec = make_spec(main_freq_hz=137.0, noise_freq_hz=311.0, n_samples=256)
+    b = generate(spec)
+    filtered = suppress_tone(forward(b.noisy, spec.sample_rate_hz), spec.noise_freq_hz)
+    err = rmse(reconstruct(filtered), b.clean)
+    assert RTOL_LEAK_MIN * spec.main_amp < err < RTOL_LEAKY * spec.main_amp
+
+
+def test_T12_suppress_does_not_mutate_input():
+    """T-12: Spectrum 不可變。"""
+    spec = make_spec()
+    s = forward(generate(spec).noisy, spec.sample_rate_hz)
+    before = s.coeffs.copy()
+    suppress_tone(s, spec.noise_freq_hz)
+    assert_allclose(s.coeffs, before, atol=0, rtol=0)
+```
+
+```python
+# tests/test_app.py
+import pytest
+from streamlit.testing.v1 import AppTest
+
+APP = "ifft_sim/ui/app.py"
+
+
+def _set_basic(at, main=50.0, noise=125.0, fs=1000.0):
+    """MUST 以 key 定址，不得依賴 widget 出現順序。"""
+    at.number_input("main_freq").set_value(main)
+    at.number_input("noise_freq").set_value(noise)
+    at.number_input("sample_rate").set_value(fs)
+    return at
+
+
+def test_T11_app_runs_without_exception():
+    at = _set_basic(AppTest.from_file(APP)).run()
+    assert not at.exception
+
+
+def test_T11_nyquist_violation_shows_error_not_traceback():
+    """fs 低於 2*f_main：畫面 MUST 出現錯誤訊息，且 MUST NOT 噴 traceback。"""
+    at = _set_basic(AppTest.from_file(APP), main=60.0, noise=80.0, fs=100.0).run()
+    assert not at.exception
+    assert len(at.error) >= 1
+
+
+def test_T11b_metric_matches_core_computation():
+    """UI 顯示的 rmse MUST 等於直接呼叫 core 的結果。"""
+    from ifft_sim.core.signal_gen import generate
+    from ifft_sim.core.spectrum import forward, reconstruct, suppress_tone
+    from ifft_sim.core.metrics import rmse
+    from ifft_sim.core.types import SignalSpec
+
+    spec = SignalSpec(main_freq_hz=50.0, noise_freq_hz=125.0,
+                      n_samples=512, sample_rate_hz=1000.0)
+    b = generate(spec)
+    expected = rmse(
+        reconstruct(suppress_tone(forward(b.noisy, spec.sample_rate_hz), spec.noise_freq_hz)),
+        b.clean,
+    )
+
+    at = _set_basic(AppTest.from_file(APP)).run()
+    shown = next(m for m in at.metric if "rmse" in m.label.lower())
+    assert float(shown.value) == pytest.approx(expected, rel=1e-6)
+```
+
+---
+
+## 8. 驗收清單（Definition of Done）
+
+- [ ] `pytest -q` 全綠，且 `pytest --cov=ifft_sim/core --cov-fail-under=90` 通過
+- [ ] T-01 至 T-13 全部存在且各自實質斷言（非 placeholder）
+- [ ] `streamlit run ifft_sim/ui/app.py` 可啟動並顯示時域波形圖
+- [ ] 故意設 `sample_rate_hz = 100, main_freq_hz = 60` → 畫面出現可讀錯誤訊息，非 traceback
+- [ ] `ifft_sim/core` 內無任何 UI／繪圖 import（T-10 保證）
+- [ ] `pyproject.toml` 列出全部相依並固定主版本，且**未出現** `hypothesis-pytest`、`pytest-coverage`、`pytest-cover`
+- [ ] 全部 UI 測試以 key 定址，`grep -n "number_input\[" tests/` 應無結果
+
+## 9. 給實作端的最後指示
+
+回報時 MUST 附上：
+1. 完整檔案樹與各檔案內容。
+2. `pytest` 實際輸出（含覆蓋率）。
+3. 一份「偏離清單」：任何與本協定不符之處，逐條說明原因。**若無偏離，明寫「無偏離」**。
+4. 不得為了讓測試通過而修改測試或容差；若實作無法滿足某條款，回報衝突並停止，由需求端裁決。
